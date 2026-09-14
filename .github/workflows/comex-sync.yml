@@ -1,0 +1,42 @@
+name: Comex → Selly
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 20 * * *"
+      timezone: "Europe/Warsaw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: comex-selly-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Aktualizacja comex.csv
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v7
+
+      - name: Uruchom Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Pobierz COMEX, przelicz USD i wyslij CSV
+        env:
+          COMEX_XML_URL: ${{ secrets.COMEX_XML_URL }}
+
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_DIR: ${{ secrets.FTP_DIR }}
+          FTP_MODE: ${{ secrets.FTP_MODE }}
+
+        run: python comex_sync.py
