@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 
 # ============================================================
@@ -24,9 +25,6 @@ NBP_URL = (
     "rates/A/USD/?format=json"
 )
 
-# Feed obecnie ma ponad 300 produktow.
-# Jezeli nagle dostaniemy np. 20 produktow,
-# nie publikujemy pliku do Selly.
 MIN_PRODUCTS = 100
 
 CSV_FIELDS = [
@@ -43,7 +41,7 @@ CSV_FIELDS = [
 
 
 # ============================================================
-# SECRETS / ENV
+# ENV / SECRETS
 # ============================================================
 
 def get_env(name: str) -> str:
@@ -58,43 +56,314 @@ def get_env(name: str) -> str:
 
 
 # ============================================================
-# COMEX - POBIERANIE PRZEZ CURL
+# BEZPIECZNE LOGOWANIE URL
+# ============================================================
+
+def safe_url(url: str) -> str:
+    """
+    Zwraca URL bez query string.
+    Dzięki temu haslo/token COMEX nie trafi do logu.
+    """
+
+    try:
+        parsed = urlsplit(url)
+
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                "",
+                "",
+            )
+        )
+
+    except Exception:
+        return "[URL UKRYTY]"
+
+
+def redact_sensitive(
+    text: str,
+    source_url: str,
+) -> str:
+    """
+    Usuwa z tekstu URL COMEX i wartosci parametrow
+    query, np. password/token.
+    """
+
+    if not text:
+        return text
+
+    result = text
+
+    # Pełny URL
+    result = result.replace(
+        source_url,
+        "[COMEX_URL_UKRYTY]",
+    )
+
+    try:
+        parsed = urlsplit(source_url)
+
+        for key, value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        ):
+
+            if not value:
+                continue
+
+            candidates = {
+                value,
+                unquote_plus(value),
+            }
+
+            for candidate in candidates:
+                if candidate:
+                    result = result.replace(
+                        candidate,
+                        "***",
+                    )
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ============================================================
+# DIAGNOSTYKA NAGLOWKOW HTTP
+# ============================================================
+
+def parse_final_headers(
+    header_text: str,
+) -> dict[str, str]:
+
+    headers: dict[str, str] = {}
+
+    for raw_line in header_text.splitlines():
+        line = raw_line.strip()
+
+        if line.upper().startswith("HTTP/"):
+            # Kolejna odpowiedz po redirect.
+            # Zachowujemy tylko ostatnia.
+            headers = {
+                "_status_line": line
+            }
+            continue
+
+        if ":" in line:
+            key, value = line.split(
+                ":",
+                1,
+            )
+
+            headers[
+                key.strip().lower()
+            ] = value.strip()
+
+    return headers
+
+
+def show_comex_diagnostics(
+    *,
+    source_url: str,
+    data: bytes,
+    curl_info: dict[str, str],
+    header_text: str,
+) -> None:
+
+    headers = parse_final_headers(
+        header_text
+    )
+
+    print("")
+    print(
+        "========== DIAGNOSTYKA COMEX =========="
+    )
+
+    print(
+        f"Adres: {safe_url(source_url)}"
+    )
+
+    print(
+        "HTTP status: "
+        f"{curl_info.get('HTTP_STATUS', 'brak')}"
+    )
+
+    print(
+        "Content-Type: "
+        f"{curl_info.get('CONTENT_TYPE', 'brak')}"
+    )
+
+    print(
+        "Rozmiar wg curl: "
+        f"{curl_info.get('SIZE_DOWNLOAD', 'brak')}"
+    )
+
+    print(
+        f"Rozmiar pliku: {len(data)} bajtow"
+    )
+
+    effective_url = curl_info.get(
+        "EFFECTIVE_URL",
+        "",
+    )
+
+    if effective_url:
+        print(
+            "Finalny adres: "
+            f"{safe_url(effective_url)}"
+        )
+
+    remote_ip = curl_info.get(
+        "REMOTE_IP",
+        "",
+    )
+
+    if remote_ip:
+        print(
+            f"Remote IP: {remote_ip}"
+        )
+
+    selected_headers = [
+        "server",
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "location",
+        "cf-ray",
+        "x-cache",
+        "x-powered-by",
+        "x-sucuri-id",
+        "x-sucuri-cache",
+    ]
+
+    print("")
+    print("Wybrane naglowki:")
+
+    found_header = False
+
+    for header in selected_headers:
+        value = headers.get(header)
+
+        if value:
+            found_header = True
+
+            value = redact_sensitive(
+                value,
+                source_url,
+            )
+
+            print(
+                f"{header}: {value}"
+            )
+
+    if not found_header:
+        print(
+            "(brak dodatkowych naglowkow)"
+        )
+
+    print("")
+    print(
+        "Poczatek odpowiedzi COMEX:"
+    )
+
+    try:
+        preview = data[:2000].decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    except Exception:
+        preview = repr(
+            data[:500]
+        )
+
+    preview = redact_sensitive(
+        preview,
+        source_url,
+    )
+
+    # Czytelniejszy log GitHub.
+    preview = preview.replace(
+        "\r",
+        " ",
+    ).replace(
+        "\n",
+        " ",
+    )
+
+    # Ograniczamy ilosc danych w logu.
+    preview = preview[:1500]
+
+    print(
+        "----- START ODPOWIEDZI -----"
+    )
+
+    print(preview)
+
+    print(
+        "----- KONIEC ODPOWIEDZI -----"
+    )
+
+    print(
+        "======================================="
+    )
+    print("")
+
+
+# ============================================================
+# COMEX - CURL
 # ============================================================
 
 def download_comex(url: str) -> bytes:
-    """
-    Pobiera feed COMEX przez curl.
 
-    --compressed jest tutaj bardzo wazne:
-    curl automatycznie obsluguje gzip / deflate / brotli,
-    jezeli serwer zwroci XML w postaci skompresowanej.
-    """
-
-    print("Pobieram XML COMEX przez curl...")
+    print(
+        "Pobieram XML COMEX przez curl..."
+    )
 
     with tempfile.NamedTemporaryFile(
         suffix=".xml",
         delete=False,
-    ) as temp_file:
-        temp_path = Path(temp_file.name)
+    ) as body_file:
+        body_path = Path(
+            body_file.name
+        )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".headers",
+        delete=False,
+    ) as header_file:
+        header_path = Path(
+            header_file.name
+        )
 
     try:
+
         command = [
             "curl",
-            "--fail",
+
             "--silent",
             "--show-error",
+
             "--location",
             "--compressed",
+
             "--retry",
             "3",
+
             "--retry-delay",
             "5",
+
             "--retry-all-errors",
+
             "--connect-timeout",
             "30",
+
             "--max-time",
             "120",
+
             "--user-agent",
             (
                 "Mozilla/5.0 "
@@ -103,10 +372,31 @@ def download_comex(url: str) -> bytes:
                 "(KHTML, like Gecko) "
                 "Chrome/153.0 Safari/537.36"
             ),
+
             "--header",
             "Accept: application/xml,text/xml,*/*",
+
+            "--header",
+            "Cache-Control: no-cache",
+
+            "--header",
+            "Pragma: no-cache",
+
+            "--dump-header",
+            str(header_path),
+
             "--output",
-            str(temp_path),
+            str(body_path),
+
+            "--write-out",
+            (
+                "HTTP_STATUS=%{http_code}\n"
+                "CONTENT_TYPE=%{content_type}\n"
+                "EFFECTIVE_URL=%{url_effective}\n"
+                "REMOTE_IP=%{remote_ip}\n"
+                "SIZE_DOWNLOAD=%{size_download}\n"
+            ),
+
             url,
         ]
 
@@ -118,59 +408,182 @@ def download_comex(url: str) -> bytes:
             check=False,
         )
 
+        safe_stderr = redact_sensitive(
+            result.stderr,
+            url,
+        )
+
+        if not body_path.exists():
+            raise RuntimeError(
+                "curl nie utworzyl pliku odpowiedzi COMEX."
+            )
+
+        data = body_path.read_bytes()
+
+        header_text = ""
+
+        if header_path.exists():
+            header_text = (
+                header_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            )
+
+        curl_info: dict[str, str] = {}
+
+        for line in result.stdout.splitlines():
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split(
+                "=",
+                1,
+            )
+
+            curl_info[
+                key.strip()
+            ] = value.strip()
+
+        print(
+            f"Pobrano z COMEX: {len(data)} bajtow."
+        )
+
+        http_status = curl_info.get(
+            "HTTP_STATUS",
+            "",
+        )
+
+        # ----------------------------------------------------
+        # CURL ERROR
+        # ----------------------------------------------------
+
         if result.returncode != 0:
-            raise RuntimeError(
-                "Nie udalo sie pobrac XML COMEX przez curl. "
-                f"curl exit code: {result.returncode}. "
-                f"Blad: {result.stderr.strip()}"
+
+            show_comex_diagnostics(
+                source_url=url,
+                data=data,
+                curl_info=curl_info,
+                header_text=header_text,
             )
 
-        if not temp_path.exists():
             raise RuntimeError(
-                "curl nie utworzyl pliku COMEX."
+                "curl zakonczyl sie bledem. "
+                f"Exit code: {result.returncode}. "
+                f"Szczegoly: {safe_stderr}"
             )
 
-        data = temp_path.read_bytes()
+        # ----------------------------------------------------
+        # HTTP ERROR
+        # ----------------------------------------------------
+
+        if not http_status.startswith("2"):
+
+            show_comex_diagnostics(
+                source_url=url,
+                data=data,
+                curl_info=curl_info,
+                header_text=header_text,
+            )
+
+            raise RuntimeError(
+                f"COMEX zwrocil HTTP {http_status}."
+            )
+
+        # ----------------------------------------------------
+        # PUSTA ODPOWIEDZ
+        # ----------------------------------------------------
 
         if not data:
+
+            show_comex_diagnostics(
+                source_url=url,
+                data=data,
+                curl_info=curl_info,
+                header_text=header_text,
+            )
+
             raise RuntimeError(
                 "COMEX zwrocil pusty plik."
             )
 
-        print(
-            f"Pobrano XML COMEX: {len(data)} bajtow."
+        # ----------------------------------------------------
+        # SPRAWDZENIE XML
+        # ----------------------------------------------------
+
+        stripped = data.lstrip()
+
+        looks_like_xml = (
+            stripped.startswith(
+                b"<?xml"
+            )
+            or stripped.startswith(
+                b"<products"
+            )
         )
 
-        # Jezeli mimo --compressed dostalibysmy surowy gzip.
-        if data.startswith(b"\x1f\x8b"):
-            raise RuntimeError(
-                "COMEX nadal zwrocil surowe dane GZIP. "
-                "Plik nie zostanie przetworzony."
-            )
+        contains_products = (
+            b"<products" in data[:2000]
+        )
 
-        # Podstawowa kontrola, czy to rzeczywiscie XML produktowy.
-        preview = data[:1000].lstrip()
+        ends_correctly = (
+            b"</products>" in data[-2000:]
+        )
 
         if (
-            b"<products" not in preview
-            and b"<?xml" not in preview
+            not looks_like_xml
+            or not contains_products
+            or not ends_correctly
         ):
-            raise RuntimeError(
-                "COMEX nie zwrocil oczekiwanego XML. "
-                "Mozliwa odpowiedz HTML / komunikat bledu."
+
+            show_comex_diagnostics(
+                source_url=url,
+                data=data,
+                curl_info=curl_info,
+                header_text=header_text,
             )
 
-        if b"</products>" not in data[-1000:]:
             raise RuntimeError(
-                "XML COMEX wyglada na niepelny / uciety. "
-                "Brakuje znacznika </products>."
+                "COMEX nie zwrocil kompletnego "
+                "oczekiwanego XML produktowego."
             )
+
+        # ----------------------------------------------------
+        # TEST PARSERA
+        # ----------------------------------------------------
+
+        try:
+            ET.fromstring(data)
+
+        except ET.ParseError as exc:
+
+            show_comex_diagnostics(
+                source_url=url,
+                data=data,
+                curl_info=curl_info,
+                header_text=header_text,
+            )
+
+            raise RuntimeError(
+                f"XML COMEX jest nieprawidlowy: {exc}"
+            ) from exc
+
+        print(
+            "Odpowiedz COMEX jest poprawnym XML."
+        )
 
         return data
 
     finally:
+
         try:
-            temp_path.unlink()
+            body_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        try:
+            header_path.unlink()
         except FileNotFoundError:
             pass
 
@@ -179,42 +592,63 @@ def download_comex(url: str) -> bytes:
 # NBP
 # ============================================================
 
-def download_json(url: str) -> dict:
+def download_json(
+    url: str,
+) -> dict:
+
     request = urllib.request.Request(
         url,
         headers={
-            "Accept": "application/json",
-            "User-Agent": "Kompleksmedia-Comex-Sync/2.0",
+            "Accept":
+                "application/json",
+
+            "User-Agent":
+                "Kompleksmedia-Comex-Sync/3.0",
         },
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
             timeout=60,
         ) as response:
+
             data = response.read()
 
     except Exception as exc:
+
         raise RuntimeError(
-            f"Nie udalo sie pobrac danych z NBP: {exc}"
+            f"Nie udalo sie pobrac danych "
+            f"z NBP: {exc}"
         ) from exc
 
     try:
+
         return json.loads(
             data.decode("utf-8")
         )
 
     except Exception as exc:
+
         raise RuntimeError(
             "NBP zwrocil nieprawidlowy JSON."
         ) from exc
 
 
-def get_usd_rate() -> tuple[Decimal, str, str]:
-    payload = download_json(NBP_URL)
+def get_usd_rate() -> tuple[
+    Decimal,
+    str,
+    str,
+]:
 
-    rates = payload.get("rates")
+    payload = download_json(
+        NBP_URL
+    )
+
+    rates = payload.get(
+        "rates"
+    )
 
     if (
         not isinstance(rates, list)
@@ -227,21 +661,28 @@ def get_usd_rate() -> tuple[Decimal, str, str]:
     rate_data = rates[0]
 
     try:
+
         rate = Decimal(
-            str(rate_data["mid"])
+            str(
+                rate_data["mid"]
+            )
         )
 
     except (
         KeyError,
         InvalidOperation,
     ) as exc:
+
         raise RuntimeError(
-            "Nieprawidlowy kurs USD w odpowiedzi NBP."
+            "Nieprawidlowy kurs USD "
+            "w odpowiedzi NBP."
         ) from exc
 
     if rate <= Decimal("0"):
+
         raise RuntimeError(
-            f"Nieprawidlowy kurs USD/PLN: {rate}"
+            f"Nieprawidlowy kurs "
+            f"USD/PLN: {rate}"
         )
 
     effective_date = str(
@@ -274,12 +715,15 @@ def get_xml_value(
     field: str,
 ) -> str:
 
-    element = product.find(field)
+    element = product.find(
+        field
+    )
 
     if (
         element is None
         or element.text is None
     ):
+
         raise RuntimeError(
             f"Brak pola <{field}> "
             "w jednym z produktow."
@@ -288,42 +732,62 @@ def get_xml_value(
     return element.text.strip()
 
 
+# ============================================================
+# XML -> CSV
+# ============================================================
+
 def create_csv(
     xml_data: bytes,
     usd_rate: Decimal,
 ) -> int:
 
     try:
-        root = ET.fromstring(xml_data)
+
+        root = ET.fromstring(
+            xml_data
+        )
 
     except ET.ParseError as exc:
+
         raise RuntimeError(
             f"Nieprawidlowy XML COMEX: {exc}"
         ) from exc
 
     if root.tag != "products":
+
         raise RuntimeError(
             f"Nieoczekiwany element glowny XML: "
             f"<{root.tag}>"
         )
 
-    products = root.findall("./product")
+    products = root.findall(
+        "./product"
+    )
 
-    product_count = len(products)
+    product_count = len(
+        products
+    )
 
     print(
-        f"XML COMEX zawiera {product_count} produktow."
+        f"XML COMEX zawiera "
+        f"{product_count} produktow."
     )
 
     if product_count < MIN_PRODUCTS:
+
         raise RuntimeError(
-            f"XML zawiera tylko {product_count} produktow. "
-            f"Minimum bezpieczenstwa to {MIN_PRODUCTS}. "
-            "Plik FTP nie zostanie nadpisany."
+            f"XML zawiera tylko "
+            f"{product_count} produktow. "
+            f"Minimum bezpieczenstwa: "
+            f"{MIN_PRODUCTS}. "
+            "FTP nie zostanie nadpisany."
         )
 
     product_ids: set[str] = set()
-    rows: list[dict[str, str]] = []
+
+    rows: list[
+        dict[str, str]
+    ] = []
 
     for index, product in enumerate(
         products,
@@ -361,8 +825,15 @@ def create_csv(
         )
 
         try:
-            quantity_int = int(quantity)
-            product_id_int = int(product_id)
+
+            quantity_int = int(
+                quantity
+            )
+
+            product_id_int = int(
+                product_id
+            )
+
             usd_price = Decimal(
                 usd_price_text
             )
@@ -371,44 +842,49 @@ def create_csv(
             ValueError,
             InvalidOperation,
         ) as exc:
+
             raise RuntimeError(
-                f"Nieprawidlowe dane liczbowe "
+                f"Nieprawidlowe dane "
                 f"w rekordzie #{index}, "
                 f"product_id={product_id}"
             ) from exc
 
         if quantity_int < 0:
+
             raise RuntimeError(
                 f"Ujemny stan magazynowy: "
                 f"product_id={product_id}"
             )
 
         if product_id_int <= 0:
+
             raise RuntimeError(
                 f"Nieprawidlowy product_id: "
                 f"{product_id}"
             )
 
         if usd_price < Decimal("0"):
+
             raise RuntimeError(
                 f"Ujemna cena USD: "
                 f"product_id={product_id}"
             )
 
         if product_id in product_ids:
+
             raise RuntimeError(
                 f"Powtorzony product_id: "
                 f"{product_id}"
             )
 
-        product_ids.add(product_id)
+        product_ids.add(
+            product_id
+        )
 
-        # ====================================================
-        # PRZELICZENIE USD -> PLN
-        # ====================================================
-
+        # USD -> PLN
         pln_price = (
-            usd_price * usd_rate
+            usd_price
+            * usd_rate
         ).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
@@ -418,8 +894,8 @@ def create_csv(
             f"{pln_price:.2f}"
         )
 
-        # Trzy identyczne ceny bazowe.
-        # Narzuty beda robione po stronie Selly.
+        # Trzy identyczne ceny PLN.
+        # Marze beda ustawiane w Selly.
         rows.append(
             {
                 "quantity":
@@ -451,10 +927,6 @@ def create_csv(
             }
         )
 
-    # ========================================================
-    # CSV
-    # ========================================================
-
     with OUTPUT_FILE.open(
         "w",
         encoding="utf-8",
@@ -471,14 +943,18 @@ def create_csv(
         )
 
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            rows
+        )
 
     if (
         not OUTPUT_FILE.exists()
         or OUTPUT_FILE.stat().st_size == 0
     ):
+
         raise RuntimeError(
-            "Wygenerowany comex.csv jest pusty."
+            "Wygenerowany comex.csv "
+            "jest pusty."
         )
 
     return len(rows)
@@ -490,9 +966,17 @@ def create_csv(
 
 def connect_ftp() -> ftplib.FTP:
 
-    host = get_env("FTP_HOST")
-    user = get_env("FTP_USER")
-    password = get_env("FTP_PASSWORD")
+    host = get_env(
+        "FTP_HOST"
+    )
+
+    user = get_env(
+        "FTP_USER"
+    )
+
+    password = get_env(
+        "FTP_PASSWORD"
+    )
 
     mode = os.environ.get(
         "FTP_MODE",
@@ -500,7 +984,8 @@ def connect_ftp() -> ftplib.FTP:
     ).strip().upper()
 
     print(
-        f"Laczenie z FTP w trybie {mode}..."
+        f"Laczenie z serwerem "
+        f"w trybie {mode}..."
     )
 
     if mode == "FTPS":
@@ -536,15 +1021,18 @@ def connect_ftp() -> ftplib.FTP:
         )
 
     else:
+
         raise RuntimeError(
-            "FTP_MODE musi miec wartosc "
-            "FTP albo FTPS."
+            "FTP_MODE musi miec "
+            "wartosc FTP albo FTPS."
         )
 
-    ftp.set_pasv(True)
+    ftp.set_pasv(
+        True
+    )
 
     print(
-        "Polaczenie FTP zostalo nawiazane."
+        "Polaczenie FTP/FTPS nawiazane."
     )
 
     return ftp
@@ -553,7 +1041,10 @@ def connect_ftp() -> ftplib.FTP:
 def ftp_missing(
     exc: ftplib.error_perm,
 ) -> bool:
-    return str(exc).startswith("550")
+
+    return str(exc).startswith(
+        "550"
+    )
 
 
 def delete_if_exists(
@@ -562,10 +1053,16 @@ def delete_if_exists(
 ) -> None:
 
     try:
-        ftp.delete(filename)
+
+        ftp.delete(
+            filename
+        )
 
     except ftplib.error_perm as exc:
-        if not ftp_missing(exc):
+
+        if not ftp_missing(
+            exc
+        ):
             raise
 
 
@@ -573,17 +1070,18 @@ def ensure_ftp_directory(
     ftp: ftplib.FTP,
     path: str,
 ) -> None:
-    """
-    Przechodzi do katalogu FTP.
-    Jezeli katalog nie istnieje, probuje go utworzyc.
-    """
 
     path = path.strip()
 
-    if not path or path == "/":
+    if (
+        not path
+        or path == "/"
+    ):
         return
 
-    if path.startswith("/"):
+    if path.startswith(
+        "/"
+    ):
         ftp.cwd("/")
 
     parts = [
@@ -593,24 +1091,36 @@ def ensure_ftp_directory(
     ]
 
     for part in parts:
+
         try:
-            ftp.cwd(part)
+
+            ftp.cwd(
+                part
+            )
 
         except ftplib.error_perm as exc:
 
-            if not ftp_missing(exc):
+            if not ftp_missing(
+                exc
+            ):
                 raise
 
             print(
-                f"Tworze katalog FTP: {part}"
+                f"Tworze katalog FTP: "
+                f"{part}"
             )
 
-            ftp.mkd(part)
-            ftp.cwd(part)
+            ftp.mkd(
+                part
+            )
+
+            ftp.cwd(
+                part
+            )
 
 
 # ============================================================
-# UPLOAD
+# FTP UPLOAD
 # ============================================================
 
 def upload_ftp() -> None:
@@ -620,16 +1130,27 @@ def upload_ftp() -> None:
         "",
     ).strip()
 
-    live_file = "comex.csv"
-    temp_file = "comex.upload.csv"
-    backup_file = "comex.prev.csv"
+    live_file = (
+        "comex.csv"
+    )
+
+    temp_file = (
+        "comex.upload.csv"
+    )
+
+    backup_file = (
+        "comex.prev.csv"
+    )
 
     ftp = connect_ftp()
 
     try:
+
         if ftp_dir:
+
             print(
-                f"Katalog docelowy FTP: {ftp_dir}"
+                f"Katalog FTP: "
+                f"{ftp_dir}"
             )
 
             ensure_ftp_directory(
@@ -637,14 +1158,15 @@ def upload_ftp() -> None:
                 ftp_dir,
             )
 
-        # Stary temp usuwamy.
+        # Usuwamy poprzedni temp.
         delete_if_exists(
             ftp,
             temp_file,
         )
 
         print(
-            f"Wysylam {temp_file}..."
+            f"Wysylam "
+            f"{temp_file}..."
         )
 
         with OUTPUT_FILE.open(
@@ -660,7 +1182,7 @@ def upload_ftp() -> None:
             "Plik tymczasowy wyslany."
         )
 
-        # Poprzedni backup usuwamy.
+        # Usuwamy poprzedni backup.
         delete_if_exists(
             ftp,
             backup_file,
@@ -668,8 +1190,9 @@ def upload_ftp() -> None:
 
         old_live_exists = False
 
-        # comex.csv -> comex.prev.csv
+        # Aktualny comex.csv -> comex.prev.csv
         try:
+
             ftp.rename(
                 live_file,
                 backup_file,
@@ -678,22 +1201,27 @@ def upload_ftp() -> None:
             old_live_exists = True
 
             print(
-                "Poprzedni comex.csv zapisany "
-                "jako comex.prev.csv."
+                "Poprzedni comex.csv "
+                "zapisano jako "
+                "comex.prev.csv."
             )
 
         except ftplib.error_perm as exc:
 
-            if not ftp_missing(exc):
+            if not ftp_missing(
+                exc
+            ):
                 raise
 
             print(
-                "Pierwsza publikacja - "
-                "brak poprzedniego comex.csv."
+                "Brak poprzedniego "
+                "comex.csv - "
+                "pierwsza publikacja."
             )
 
-        # comex.upload.csv -> comex.csv
+        # temp -> live
         try:
+
             ftp.rename(
                 temp_file,
                 live_file,
@@ -702,12 +1230,15 @@ def upload_ftp() -> None:
         except Exception:
 
             if old_live_exists:
+
                 print(
-                    "Blad podmiany. "
-                    "Przywracam poprzedni comex.csv..."
+                    "Blad publikacji. "
+                    "Przywracam poprzedni "
+                    "comex.csv..."
                 )
 
                 try:
+
                     delete_if_exists(
                         ftp,
                         live_file,
@@ -719,27 +1250,33 @@ def upload_ftp() -> None:
                     )
 
                     print(
-                        "Poprzedni comex.csv przywrocony."
+                        "Poprzedni comex.csv "
+                        "zostal przywrocony."
                     )
 
                 except Exception as rollback_error:
 
                     print(
-                        "UWAGA: nie udalo sie wykonac "
-                        f"rollback FTP: {rollback_error}"
+                        "UWAGA: rollback "
+                        f"nie udal sie: "
+                        f"{rollback_error}"
                     )
 
             raise
 
         print(
-            "FTP: poprawnie opublikowano comex.csv."
+            "FTP: poprawnie opublikowano "
+            "comex.csv."
         )
 
     finally:
+
         try:
+
             ftp.quit()
 
         except Exception:
+
             ftp.close()
 
 
@@ -752,9 +1289,11 @@ def main() -> None:
     print(
         "========================================"
     )
+
     print(
         "COMEX -> SELLY"
     )
+
     print(
         "========================================"
     )
@@ -763,14 +1302,15 @@ def main() -> None:
         "COMEX_XML_URL"
     )
 
-    # 1. COMEX
+    # COMEX
     xml_data = download_comex(
         comex_url
     )
 
-    # 2. NBP
+    # NBP
     print(
-        "Pobieram aktualny kurs USD/PLN z NBP..."
+        "Pobieram aktualny kurs "
+        "USD/PLN z NBP..."
     )
 
     (
@@ -780,19 +1320,21 @@ def main() -> None:
     ) = get_usd_rate()
 
     print(
-        f"Kurs NBP: 1 USD = "
-        f"{usd_rate} PLN"
+        f"Kurs NBP: "
+        f"1 USD = {usd_rate} PLN"
     )
 
     print(
-        f"Data kursu: {rate_date}"
+        f"Data kursu: "
+        f"{rate_date}"
     )
 
     print(
-        f"Tabela NBP: {table_number}"
+        f"Tabela NBP: "
+        f"{table_number}"
     )
 
-    # 3. XML -> CSV
+    # CSV
     print(
         "Przetwarzam XML COMEX..."
     )
@@ -803,7 +1345,8 @@ def main() -> None:
     )
 
     print(
-        f"Wygenerowano {count} produktow."
+        f"Wygenerowano "
+        f"{count} produktow."
     )
 
     print(
@@ -811,9 +1354,10 @@ def main() -> None:
         f"{OUTPUT_FILE.stat().st_size} bajtow."
     )
 
-    # 4. FTP
+    # FTP
     print(
-        "Wysylam comex.csv na FTP..."
+        "Wysylam comex.csv "
+        "na FTP..."
     )
 
     upload_ftp()
